@@ -1,0 +1,169 @@
+# ==========================================
+# TRIGGERS: SE ACTIVA SOLO AL CONSOLIDAR CÓDIGO
+# ==========================================
+trigger:
+  branches:
+    include:
+      - master
+      - develop
+
+pool:
+  vmImage: 'ubuntu-24.04'
+
+# ==========================================
+# VARIABLES NO SENSIBLES (diapo 7: "Variable")
+# Cambia estos valores por los tuyos
+# ==========================================
+variables:
+  APP_NAME: 'jee-msa-web-demo-pipeline'                  # mismo nombre que usas en helm/*.yaml
+  OC_PROJECT: 'austin-salguero-dev'        # tu namespace en OpenShift Sandbox
+  APPROVER_EMAIL: 'austinsalguero08@gmail.com'
+  # OPENSHIFT_TOKEN y OPENSHIFT_SERVER NO van aquí: son secretos (ver paso 3)
+
+stages:
+
+  # ==========================================
+  # STAGE 1: INTEGRACIÓN CONTINUA (CI)
+  # ==========================================
+  - stage: CI
+    displayName: 'CI'
+    jobs:
+      - job: prevalidation
+        displayName: 'Prevalidar'
+        steps:
+          - script: echo "Simulación de verificación de la estructura del repositorio realizada correctamente."
+            displayName: 'Validación inicial'
+
+      - job: build
+        displayName: 'Compilar'
+        dependsOn: prevalidation
+        steps:
+          - script: |
+              echo "Descargando JDK 25..."
+              curl -L -o $(Agent.TempDirectory)/jdk25.tar.gz "https://api.adoptium.net/v3/binary/latest/25/ga/linux/x64/jdk/hotspot/normal/eclipse"
+            displayName: 'Descargar JDK 25'
+
+          - task: JavaToolInstaller@0
+            inputs:
+              versionSpec: '25'
+              jdkArchitectureOption: 'x64'
+              jdkSourceOption: 'LocalDirectory'
+              jdkFile: '$(Agent.TempDirectory)/jdk25.tar.gz'
+              jdkDestinationDirectory: '$(Agent.ToolsDirectory)/jdk'
+              cleanDestinationDirectory: true
+            displayName: 'Instalar Java 25'
+
+          - script: |
+              chmod +x gradlew
+              ./gradlew compileJava -x test
+            displayName: 'Compilar con Gradle'
+
+      - job: test
+        displayName: 'Pruebas y Cobertura'
+        dependsOn: build
+        steps:
+          - script: |
+              echo "Descargando JDK 25..."
+              curl -L -o $(Agent.TempDirectory)/jdk25.tar.gz "https://api.adoptium.net/v3/binary/latest/25/ga/linux/x64/jdk/hotspot/normal/eclipse"
+            displayName: 'Descargar JDK 25'
+
+          - task: JavaToolInstaller@0
+            inputs:
+              versionSpec: '25'
+              jdkArchitectureOption: 'x64'
+              jdkSourceOption: 'LocalDirectory'
+              jdkFile: '$(Agent.TempDirectory)/jdk25.tar.gz'
+              jdkDestinationDirectory: '$(Agent.ToolsDirectory)/jdk'
+              cleanDestinationDirectory: true
+            displayName: 'Instalar Java 25'
+
+          - script: |
+              chmod +x gradlew
+              ./gradlew check
+            displayName: 'Ejecutar Pruebas y Cobertura'
+
+          - task: PublishCodeCoverageResults@2
+            inputs:
+              summaryFileLocation: '$(System.DefaultWorkingDirectory)/**/build/reports/jacoco/test/jacocoTestReport.xml'
+              pathToSources: '$(System.DefaultWorkingDirectory)/src/main/java'
+            displayName: 'Publicar Cobertura en Azure DevOps'
+
+  # ==========================================
+  # STAGE 2: APROBACIÓN MANUAL (APPROVAL)
+  # ==========================================
+  - stage: Approval
+    displayName: 'Aprobar'
+    dependsOn: CI
+    condition: succeeded()
+    jobs:
+      - job: manual_gate
+        displayName: 'Esperando aprobación'
+        pool: server
+        steps:
+          - task: ManualValidation@0
+            inputs:
+              notifyUsers: '$(APPROVER_EMAIL)'
+              instructions: 'Aprobación requerida para ejecutar la fase de despliegue continuo en OpenShift Sandbox.'
+              onTimeout: 'reject'
+
+  # ==========================================
+  # STAGE 3: DESPLIEGUE CONTINUO (CD)
+  # ==========================================
+  - stage: CD
+    displayName: 'CD'
+    dependsOn: Approval
+    condition: succeeded()
+    jobs:
+      - job: deploy_openshift
+        displayName: 'Desplegar en OpenShift'
+        steps:
+          - script: |
+              set -e
+              echo "=== 1. Descargando e instalando OpenShift CLI (oc) ==="
+              curl -LO https://mirror.openshift.com/pub/openshift-v4/clients/ocp/stable/openshift-client-linux.tar.gz
+              tar -xzf openshift-client-linux.tar.gz
+              sudo mv oc /usr/local/bin/
+
+              echo "=== 2. Autenticando en el Clúster ==="
+              oc login --token="$OPENSHIFT_TOKEN" --server="$OPENSHIFT_SERVER" --insecure-skip-tls-verify=true
+
+              echo "=== 3. Seleccionando Proyecto ==="
+              oc project $(OC_PROJECT)
+
+              echo "=== 4. Aplicando Manifiestos (BuildConfig, Deployment, Service, Route) ==="
+              oc apply -f helm/build-config.yaml
+              oc apply -f helm/dev.yml
+              oc apply -f helm/service.yaml
+              oc apply -f helm/route.yaml
+
+              echo "=== 5. Iniciando Build en OpenShift (Dockerfile) ==="
+              oc start-build $(APP_NAME) --follow
+
+              echo "=== 6. Reiniciando el despliegue para tomar la nueva imagen ==="
+              oc rollout restart deployment/$(APP_NAME)
+
+              echo "=== 7. Esperando a que el Pod esté listo ==="
+              oc rollout status deployment/$(APP_NAME)
+
+              echo "=== 8. Obteniendo URL de la Aplicación ==="
+              oc get route $(APP_NAME) -o jsonpath='{"URL: http://"}{.spec.host}{"\n"}'
+            displayName: 'Descarga CLI, Login y Despliegue Docker'
+            env:
+              # Diapo 7: los secretos se mapean a mano al script
+              OPENSHIFT_TOKEN: $(OPENSHIFT_TOKEN)
+              OPENSHIFT_SERVER: $(OPENSHIFT_SERVER)
+
+  # ==========================================
+  # STAGE 4: NOTIFICACIONES (NOTIFICATIONS)
+  # ==========================================
+  - stage: Notifications
+    displayName: 'Notificar'
+    dependsOn: [CI, Approval, CD]
+    condition: always()
+    jobs:
+      - job: send_status_email
+        displayName: 'Enviar Reporte'
+        steps:
+          - script: |
+              echo "Estado final de la ejecución del pipeline construido por Austin Salguero: $(Agent.JobStatus)"
+            displayName: 'Simulación de Envío de Correo Electrónico'
