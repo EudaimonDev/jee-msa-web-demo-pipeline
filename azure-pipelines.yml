@@ -89,11 +89,30 @@ stages:
             displayName: 'Publicar Cobertura en Azure DevOps'
 
   # ==========================================
-  # STAGE 2: APROBACIÓN MANUAL (APPROVAL)
+  # STAGE 2: NOTIFICAR APROBADOR POR CORREO
+  # ==========================================
+  - stage: EmailApprover
+    displayName: 'Notificar Aprobador por Correo'
+    dependsOn: CI
+    condition: succeeded()
+    jobs:
+      - job: send_email
+        displayName: 'Enviar correo al aprobador'
+        steps:
+          - script: |
+              echo "=== Simulación de envío de correo ==="
+              echo "Para:    $(APPROVER_EMAIL)"
+              echo "Asunto:  [Aprobación pendiente] $(Build.DefinitionName) #$(Build.BuildNumber)"
+              echo "Mensaje: El CI terminó OK. El despliegue a OpenShift espera tu aprobación."
+              echo "Rama: $(Build.SourceBranchName) | Autor: $(Build.RequestedFor)"
+            displayName: 'Simulación de envío de correo al aprobador'
+
+  # ==========================================
+  # STAGE 3: APROBACIÓN MANUAL (APPROVAL)
   # ==========================================
   - stage: Approval
     displayName: 'Aprobar'
-    dependsOn: CI
+    dependsOn: EmailApprover
     condition: succeeded()
     jobs:
       - job: manual_gate
@@ -107,11 +126,27 @@ stages:
               onTimeout: 'reject'
 
   # ==========================================
-  # STAGE 3: DESPLIEGUE CONTINUO (CD)
+  # STAGE 3: NOTIFICAR APROBADOR
+  # ==========================================
+  - stage: NotifyApprover
+    displayName: 'Notificar Aprobador'
+    dependsOn: Approval
+    condition: succeeded()
+    jobs:
+      - job: notify_approver
+        displayName: 'Avisar resultado de la aprobación'
+        steps:
+          - script: |
+              echo "Simulación: se notifica a $(APPROVER_EMAIL) que el despliegue fue aprobado."
+              echo "Build: $(Build.BuildNumber) | Rama: $(Build.SourceBranchName) | Commit: $(Build.SourceVersion)"
+            displayName: 'Simulación de notificación al aprobador'
+
+  # ==========================================
+  # STAGE 4: DESPLIEGUE CONTINUO (CD)
   # ==========================================
   - stage: CD
     displayName: 'CD'
-    dependsOn: Approval
+    dependsOn: NotifyApprover
     condition: succeeded()
     jobs:
       - job: deploy_openshift
@@ -154,11 +189,11 @@ stages:
               OPENSHIFT_SERVER: $(OPENSHIFT_SERVER)
 
   # ==========================================
-  # STAGE 4: NOTIFICACIONES (NOTIFICATIONS)
+  # STAGE 5: NOTIFICACIONES (NOTIFICATIONS)
   # ==========================================
   - stage: Notifications
     displayName: 'Notificar'
-    dependsOn: [CI, Approval, CD]
+    dependsOn: [CI, EmailApprover, Approval, NotifyApprover, CD]
     condition: always()
     jobs:
       - job: send_status_email
